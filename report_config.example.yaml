@@ -1,0 +1,9 @@
+# Copy to report_config.yaml (git-ignored) and fill in your own values.
+database:
+  odbc: 'Driver={ODBC Driver 18 for SQL Server};Server=YOUR_SERVER\INSTANCE;Database=YOUR_DATABASE;Trusted_Connection=yes;TrustServerCertificate=yes'
+
+source:
+  folder: 'C:\path\to\reports'
+  patterns: ["*.csv", "*.CSV"]
+  sample_header_labels: [SAMPLES, Sample]   # row that ends the column-definition block
+  job_number_keys: [Job Number]             # header key used as the report id

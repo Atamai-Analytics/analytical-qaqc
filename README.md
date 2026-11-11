@@ -61,6 +61,34 @@ DESCRIPTION,kg,ppm,ppm,...                  <- unit row
 - Other status values such as `Not Recvd` and `NSS` stay as text in `RAW_VALUE`.
 - Repeat columns (e.g. `Au Check`) keep their own `COL_NO`.
 
+## Stage 1b: raw staging of lab "Final Report" CSVs (ALS and Bureau Veritas)
+
+`load_report_staging.py` loads the current ALS and Bureau Veritas / Inspectorate "Final Report" CSV layouts into `lab.STG_REPORT*` tables. As in stage 1, values are stored as text and no business rules are applied.
+
+```bash
+cp report_config.example.yaml report_config.yaml   # then set server, database, folder
+python load_report_staging.py --dry-run
+python load_report_staging.py --create-schema      # first run
+python load_report_staging.py
+```
+
+Layout handled:
+
+1. **Header block:** `Key:,value` lines, ended by the first blank line.
+2. **Column-definition rows:** for example `Method:`, `Units:`, `Det. Lim:` (ALS) or `Method`, `Analyte`, `Unit`, `MDL` (BV). The block ends with the `SAMPLES` / `Sample` row.
+3. **Sample rows:** one per line.
+
+Encoding (UTF-8 with BOM, or Latin-1) is detected per file. Each report is keyed on its `Job Number:`.
+
+| Table | Grain | Holds |
+|---|---|---|
+| `lab.STG_REPORT` | file | job number, first line, path, hash, encoding, counts |
+| `lab.STG_REPORT_HEADER` | header line | raw label and value |
+| `lab.STG_REPORT_COLUMN` | label × column | column attributes; `COL_NO` joins to values |
+| `lab.STG_REPORT_ROW` | sample line | sample text, cell count, complete raw line |
+| `lab.STG_REPORT_VALUE` | non-blank cell | `RAW_VALUE` text |
+| `lab.V_STG_REPORT_VALUE` | view | values with their sample text |
+
 ## Next stages (planned)
 
 - Business-rule transform: assay naming, detection-limit handling, status codes, check assays and sample-ID parsing.

@@ -12,3 +12,4 @@ venv/
 *.csv
 *.xls
 *.xlsx
+report_config.yaml
