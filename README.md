@@ -89,6 +89,48 @@ Encoding (UTF-8 with BOM, or Latin-1) is detected per file. Each report is keyed
 | `lab.STG_REPORT_VALUE` | non-blank cell | `RAW_VALUE` text |
 | `lab.V_STG_REPORT_VALUE` | view | values with their sample text |
 
+## Stage 2: business rules
+
+The rules are data in the database, not code. `sql/03_business_rules.sql` creates the tables and procedures. `sql/04_rules_seed.sql` defines the rules and can be re-run safely.
+
+```sql
+EXEC lab.usp_RUN_BUSINESS_RULES;                          -- all non-INACTIVE rules
+EXEC lab.usp_RUN_BUSINESS_RULES @Label = 'DespatchSend';  -- one label
+EXEC lab.usp_RUN_BUSINESS_RULES @RuleId = 1;              -- one rule
+SELECT * FROM lab.V_RULE_RESULT_LATEST;                   -- latest outcome per rule / report
+```
+
+| Table | Holds |
+|---|---|
+| `lab.BUSINESS_RULE_LABEL` | Rule groups and `LABEL_ORDER`; labels run lowest first |
+| `lab.BUSINESS_RULE` | One row per rule: label, `RUN_ORDER` within the label, type, level, `FLAG` |
+| `lab.BUSINESS_RULE_STEP` | Ordered steps for CHAIN rules |
+| `lab.RULE_RUN` / `lab.RULE_RESULT` | Run history and every outcome, including the value a CHAIN rule resolved |
+
+**FLAG** can be `PASS`, `WARN`, `FAIL` or `INACTIVE`:
+
+- **On a rule:** how a failure is reported, or `INACTIVE` to skip the rule.
+- **On a step:** the outcome when that step matches, or `INACTIVE` to skip the step.
+
+**Rule types:**
+
+- **CHAIN:** ordered fallback steps, where the first step that matches wins. Each step reads a value from a source and tests a condition:
+  - **Source:** a report header line (`HEADER`) or a `lab.STG_REPORT` column (`REPORT`).
+  - **Condition:** `NOT_BLANK`, or `EXISTS` in a lookup table and column.
+
+  If no step matches, the rule's FLAG is used. Each result records the winning step, the value it produced, and every step tried.
+- **SQL:** a single `SELECT` returning `JOB_NUMBER`, `SAMPLE_TEXT`, `OUTCOME` (PASS/FAIL) and `DETAIL`. A FAIL is reported using the rule's FLAG.
+
+Rules only read data and never modify staging or production tables.
+
+Example: label `DespatchSend` (runs first), rule "Resolve DespatchNo" (CHAIN):
+
+| Step | Source | Condition | FLAG |
+|---|---|---|---|
+| 10 | Header `P.O. Number:` | exists in `DESPATCHSEND.DESPATCHNO` | PASS |
+| 20 | Header `Shipment ID:` | exists in `DESPATCHSEND.DESPATCHNO` | PASS |
+| 30 | `JOB_NUMBER` (lab job number) | not blank | PASS |
+
 ## Next stages (planned)
 
 - Business-rule transform: assay naming, detection-limit handling, status codes, check assays and sample-ID parsing.
