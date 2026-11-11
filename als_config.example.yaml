@@ -1,0 +1,14 @@
+# ALS certificate -> raw staging loader
+# Copy to als_config.yaml (git-ignored) and fill in your own values.
+database:
+  # Windows authentication example; use UID=...;PWD=... for SQL logins
+  odbc: "Driver={ODBC Driver 18 for SQL Server};Server=YOUR_SERVER\\INSTANCE;Database=YOUR_DATABASE;Trusted_Connection=yes;TrustServerCertificate=yes"
+
+source:
+  folder: 'C:\path\to\certificates\ALS'
+  pattern: "*.csv"
+  encoding: latin-1
+  # Files are read in place and never moved or modified.
+
+# Business rules (assay naming, < / > handling, NSS / Listed-NR codes,
+# promotion into the target geology database) are intentionally NOT applied here.

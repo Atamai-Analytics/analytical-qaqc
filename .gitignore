@@ -1,0 +1,14 @@
+# Local config holds server, database and data paths
+als_config.yaml
+*.local.yaml
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.log
+
+# Never commit lab data
+*.csv
+*.xls
+*.xlsx
