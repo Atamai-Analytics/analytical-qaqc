@@ -5,18 +5,33 @@
    lab.BUSINESS_RULE        one row per rule; RULE_LABEL groups rules (e.g. DespatchSend),
                             RUN_ORDER orders rules within their label
    lab.BUSINESS_RULE_STEP   ordered steps for CHAIN rules (first match wins)
+   lab.BUSINESS_RULE_PARAM  parameter values for a rule (e.g. the prefixes of an IGNORE_PREFIX rule)
    lab.RULE_RUN             one row per execution of the rule runner
    lab.RULE_RESULT          one row per rule x report (or x sample) outcome
    lab.usp_RUN_BUSINESS_RULES   runs all non-INACTIVE rules (or one) and logs results
    lab.usp_EVAL_CHAIN_RULE      evaluator for CHAIN rules (called by the runner)
+   lab.V_STG_SAMPLE_IGNORED     sample lines excluded by active IGNORE_PREFIX rules
+   lab.V_STG_SAMPLE_IN_SCOPE    sample lines NOT ignored - sample-level rules read from this
    lab.V_RULE_RESULT_LATEST     latest outcome per rule / report / sample
 
    FLAG (PASS | WARN | FAIL | INACTIVE)
      Rule  FLAG = how a failure of the rule is reported. FAIL = hard failure,
                   WARN = warning only, PASS = informational. INACTIVE = rule is skipped.
      Step  FLAG = the outcome when this step matches. INACTIVE = step is skipped.
+     Param FLAG = the outcome recorded when this value applies. INACTIVE = value is switched off.
 
-   Two rule types:
+   Rule types:
+
+   IGNORE_PREFIX  Sample lines whose SAMPLE_TEXT starts with any active PREFIX param are
+          excluded from sample-level rules (see lab.V_STG_SAMPLE_IN_SCOPE). Each ignored
+          line is recorded with the param's FLAG and the prefix in RESOLVED_VALUE.
+          Prefix match is exact (trailing spaces count) and case-sensitive per the database collation.
+
+   IGNORE_REPEAT_OF  Lab repeat lines of certain check types are excluded. A line is ignored when
+          its SAMPLE_TEXT starts with an active REPEAT_PREFIX param (e.g. 'REP ') and the ID after
+          the prefix exists in dbo.QV_SAMPLE_CHECK with a DUPLICATENO given by an active
+          PARENT_DUPLICATENO param (e.g. FSTD). Recorded with the PARENT_DUPLICATENO param's FLAG.
+
 
    CHAIN  Ordered steps. Each step reads a value from a SOURCE and tests a CONDITION.
           The first step whose condition is true wins. Its FLAG and value are
@@ -27,10 +42,12 @@
             CONDITION    NOT_BLANK -> value is not empty
                          EXISTS    -> value exists in LOOKUP_TABLE.LOOKUP_COLUMN
 
-   SQL    CHECK_SQL is a single SELECT returning exactly:
+   SQL    CHECK_SQL is a single SELECT returning exactly these 5 columns, in order:
             JOB_NUMBER varchar(30), SAMPLE_TEXT varchar(100) NULL,
-            OUTCOME varchar(10) (PASS | FAIL), DETAIL varchar(4000)
+            OUTCOME varchar(10) (PASS | WARN | FAIL), DETAIL varchar(4000),
+            RESOLVED_VALUE varchar(400) NULL  (a value the rule found, e.g. a DuplicateNo)
           A FAIL row is recorded with the rule's FLAG (FAIL or WARN or PASS).
+          Sample-level SQL rules should read lab.V_STG_SAMPLE_IN_SCOPE.
 
    Rules only read data; they never modify staging or dbo tables.
    Re-runnable: creates objects, or upgrades ones made by earlier versions.
@@ -61,8 +78,9 @@ CREATE TABLE lab.BUSINESS_RULE (
                                 REFERENCES lab.BUSINESS_RULE_LABEL (RULE_LABEL),  -- group, e.g. DespatchSend
     RULE_NAME    varchar(200)   NOT NULL,
     DESCRIPTION  varchar(4000)  NULL,
-    RULE_TYPE    varchar(10)    NOT NULL CONSTRAINT DF_lab_BUSINESS_RULE_TYPE DEFAULT 'SQL'
-                                CONSTRAINT CK_lab_BUSINESS_RULE_TYPE CHECK (RULE_TYPE IN ('SQL','CHAIN')),
+    RULE_TYPE    varchar(20)    NOT NULL CONSTRAINT DF_lab_BUSINESS_RULE_TYPE DEFAULT 'SQL'
+                                CONSTRAINT CK_lab_BUSINESS_RULE_TYPE
+                                CHECK (RULE_TYPE IN ('SQL','CHAIN','IGNORE_PREFIX','IGNORE_REPEAT_OF')),
     RULE_LEVEL   varchar(10)    NOT NULL CONSTRAINT CK_lab_BUSINESS_RULE_LEVEL
                                 CHECK (RULE_LEVEL IN ('REPORT','SAMPLE','VALUE')),
     FLAG         varchar(10)    NOT NULL CONSTRAINT DF_lab_BUSINESS_RULE_FLAG DEFAULT 'FAIL'
@@ -160,6 +178,74 @@ FROM sys.columns c
 WHERE (c.object_id = OBJECT_ID('lab.BUSINESS_RULE')      AND c.name IN ('IS_ACTIVE','SEVERITY','NO_MATCH_OUTCOME'))
    OR (c.object_id = OBJECT_ID('lab.BUSINESS_RULE_STEP') AND c.name IN ('IS_ACTIVE','OUTCOME'));
 IF @drop <> N'' EXEC sp_executesql @drop;
+GO
+/* v5/v6: RULE_TYPE widened to varchar(20); IGNORE_PREFIX and IGNORE_REPEAT_OF allowed */
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints
+               WHERE name = 'CK_lab_BUSINESS_RULE_TYPE' AND definition LIKE '%IGNORE[_]REPEAT[_]OF%')
+BEGIN
+    IF OBJECT_ID('lab.CK_lab_BUSINESS_RULE_TYPE', 'C') IS NOT NULL
+        ALTER TABLE lab.BUSINESS_RULE DROP CONSTRAINT CK_lab_BUSINESS_RULE_TYPE;
+    IF OBJECT_ID('lab.DF_lab_BUSINESS_RULE_TYPE', 'D') IS NOT NULL
+        ALTER TABLE lab.BUSINESS_RULE DROP CONSTRAINT DF_lab_BUSINESS_RULE_TYPE;
+    ALTER TABLE lab.BUSINESS_RULE ALTER COLUMN RULE_TYPE varchar(20) NOT NULL;
+    ALTER TABLE lab.BUSINESS_RULE ADD CONSTRAINT DF_lab_BUSINESS_RULE_TYPE DEFAULT 'SQL' FOR RULE_TYPE;
+    ALTER TABLE lab.BUSINESS_RULE ADD CONSTRAINT CK_lab_BUSINESS_RULE_TYPE
+        CHECK (RULE_TYPE IN ('SQL','CHAIN','IGNORE_PREFIX','IGNORE_REPEAT_OF'));
+END
+GO
+
+/* ---------------------------------------------------------------- params */
+IF OBJECT_ID('lab.BUSINESS_RULE_PARAM') IS NULL
+CREATE TABLE lab.BUSINESS_RULE_PARAM (
+    RULE_ID      int            NOT NULL CONSTRAINT FK_lab_RULE_PARAM_RULE
+                                REFERENCES lab.BUSINESS_RULE (RULE_ID) ON DELETE CASCADE,
+    PARAM_NAME   varchar(50)    NOT NULL,          -- e.g. PREFIX
+    PARAM_VALUE  varchar(400)   NOT NULL,          -- e.g. STD
+    FLAG         varchar(10)    NOT NULL CONSTRAINT DF_lab_RULE_PARAM_FLAG DEFAULT 'PASS'
+                                CONSTRAINT CK_lab_RULE_PARAM_FLAG CHECK (FLAG IN ('PASS','WARN','FAIL','INACTIVE')),
+    NOTES        varchar(4000)  NULL,
+    CONSTRAINT PK_lab_BUSINESS_RULE_PARAM PRIMARY KEY (RULE_ID, PARAM_NAME, PARAM_VALUE)
+);
+GO
+
+/* Sample lines excluded by active IGNORE_* rules (one row per line x rule x matching value).
+   DATALENGTH, not LEN, so a trailing space in a prefix ('REP ') counts. */
+CREATE OR ALTER VIEW lab.V_STG_SAMPLE_IGNORED AS
+/* IGNORE_PREFIX */
+SELECT  r.JOB_NUMBER, r.ROW_SEQ, r.SAMPLE_TEXT,
+        b.RULE_ID, p.PARAM_VALUE AS MATCHED_VALUE, p.FLAG,
+        CAST(CONCAT('starts with prefix "', p.PARAM_VALUE, '"') AS varchar(400)) AS REASON
+FROM    lab.STG_REPORT_ROW r
+JOIN    lab.BUSINESS_RULE_PARAM p
+          ON p.PARAM_NAME = 'PREFIX' AND p.FLAG <> 'INACTIVE'
+         AND LEFT(r.SAMPLE_TEXT, DATALENGTH(p.PARAM_VALUE)) = p.PARAM_VALUE
+JOIN    lab.BUSINESS_RULE b
+          ON b.RULE_ID = p.RULE_ID AND b.RULE_TYPE = 'IGNORE_PREFIX' AND b.FLAG <> 'INACTIVE'
+UNION ALL
+/* IGNORE_REPEAT_OF */
+SELECT  r.JOB_NUMBER, r.ROW_SEQ, r.SAMPLE_TEXT,
+        b.RULE_ID, pd.PARAM_VALUE AS MATCHED_VALUE, pd.FLAG,
+        CAST(CONCAT('lab repeat ("', pp.PARAM_VALUE, '") of ', x.PARENT_ID, ' which is a ',
+                    pd.PARAM_VALUE, ' check') AS varchar(400)) AS REASON
+FROM    lab.STG_REPORT_ROW r
+JOIN    lab.BUSINESS_RULE b
+          ON b.RULE_TYPE = 'IGNORE_REPEAT_OF' AND b.FLAG <> 'INACTIVE'
+JOIN    lab.BUSINESS_RULE_PARAM pp
+          ON pp.RULE_ID = b.RULE_ID AND pp.PARAM_NAME = 'REPEAT_PREFIX' AND pp.FLAG <> 'INACTIVE'
+         AND LEFT(r.SAMPLE_TEXT, DATALENGTH(pp.PARAM_VALUE)) = pp.PARAM_VALUE
+CROSS APPLY (SELECT LTRIM(SUBSTRING(r.SAMPLE_TEXT, DATALENGTH(pp.PARAM_VALUE) + 1, 100)) AS PARENT_ID) x
+JOIN    lab.BUSINESS_RULE_PARAM pd
+          ON pd.RULE_ID = b.RULE_ID AND pd.PARAM_NAME = 'PARENT_DUPLICATENO' AND pd.FLAG <> 'INACTIVE'
+WHERE   EXISTS (SELECT 1 FROM dbo.QV_SAMPLE_CHECK c
+                WHERE c.SAMPLEID = x.PARENT_ID AND c.DUPLICATENO = pd.PARAM_VALUE);
+GO
+
+/* Sample lines in scope for sample-level rules: everything not ignored */
+CREATE OR ALTER VIEW lab.V_STG_SAMPLE_IN_SCOPE AS
+SELECT  r.*
+FROM    lab.STG_REPORT_ROW r
+WHERE   NOT EXISTS (SELECT 1 FROM lab.V_STG_SAMPLE_IGNORED i
+                    WHERE i.JOB_NUMBER = r.JOB_NUMBER AND i.ROW_SEQ = r.ROW_SEQ);
 GO
 
 /* ---------------------------------------------------------------- runs / results */
@@ -293,14 +379,15 @@ CREATE OR ALTER PROCEDURE lab.usp_RUN_BUSINESS_RULES
 AS
 BEGIN
     SET NOCOUNT ON;
-    DECLARE @run int, @rid int, @type varchar(10), @flag varchar(10), @sql nvarchar(max),
+    DECLARE @run int, @rid int, @type varchar(20), @flag varchar(10), @sql nvarchar(max),
             @n int = 0, @err int = 0;
 
     INSERT lab.RULE_RUN DEFAULT VALUES;
     SET @run = SCOPE_IDENTITY();
 
     CREATE TABLE #out (JOB_NUMBER varchar(30) COLLATE DATABASE_DEFAULT, SAMPLE_TEXT varchar(100) COLLATE DATABASE_DEFAULT,
-                       OUTCOME varchar(10) COLLATE DATABASE_DEFAULT, DETAIL varchar(4000) COLLATE DATABASE_DEFAULT);
+                       OUTCOME varchar(10) COLLATE DATABASE_DEFAULT, DETAIL varchar(4000) COLLATE DATABASE_DEFAULT,
+                       RESOLVED_VALUE varchar(400) COLLATE DATABASE_DEFAULT);
 
     DECLARE rules CURSOR LOCAL FAST_FORWARD FOR
         SELECT b.RULE_ID, b.RULE_TYPE, b.FLAG, b.CHECK_SQL
@@ -318,13 +405,21 @@ BEGIN
         BEGIN TRY
             IF @type = 'CHAIN'
                 EXEC lab.usp_EVAL_CHAIN_RULE @RunId = @run, @RuleId = @rid;
+            ELSE IF @type IN ('IGNORE_PREFIX', 'IGNORE_REPEAT_OF')
+                /* one row per ignored line; if several values match, the first (alphabetical) is shown */
+                INSERT lab.RULE_RESULT (RUN_ID, RULE_ID, JOB_NUMBER, SAMPLE_TEXT, OUTCOME, DETAIL, RESOLVED_VALUE)
+                SELECT @run, @rid, i.JOB_NUMBER, i.SAMPLE_TEXT, i.FLAG,
+                       CONCAT('Ignored: line ', i.ROW_SEQ, ' ', i.REASON), i.MATCHED_VALUE
+                FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY JOB_NUMBER, ROW_SEQ ORDER BY MATCHED_VALUE) rn
+                      FROM lab.V_STG_SAMPLE_IGNORED WHERE RULE_ID = @rid) i
+                WHERE i.rn = 1;
             ELSE
             BEGIN
                 TRUNCATE TABLE #out;
-                INSERT #out (JOB_NUMBER, SAMPLE_TEXT, OUTCOME, DETAIL) EXEC sp_executesql @sql;
-                INSERT lab.RULE_RESULT (RUN_ID, RULE_ID, JOB_NUMBER, SAMPLE_TEXT, OUTCOME, DETAIL)
+                INSERT #out (JOB_NUMBER, SAMPLE_TEXT, OUTCOME, DETAIL, RESOLVED_VALUE) EXEC sp_executesql @sql;
+                INSERT lab.RULE_RESULT (RUN_ID, RULE_ID, JOB_NUMBER, SAMPLE_TEXT, OUTCOME, DETAIL, RESOLVED_VALUE)
                 SELECT @run, @rid, JOB_NUMBER, SAMPLE_TEXT,
-                       CASE WHEN OUTCOME = 'FAIL' THEN @flag ELSE OUTCOME END, DETAIL
+                       CASE WHEN OUTCOME = 'FAIL' THEN @flag ELSE OUTCOME END, DETAIL, RESOLVED_VALUE
                 FROM #out;
             END
         END TRY

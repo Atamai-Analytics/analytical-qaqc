@@ -105,12 +105,16 @@ SELECT * FROM lab.V_RULE_RESULT_LATEST;                   -- latest outcome per 
 | `lab.BUSINESS_RULE_LABEL` | Rule groups and `LABEL_ORDER`; labels run lowest first |
 | `lab.BUSINESS_RULE` | One row per rule: label, `RUN_ORDER` within the label, type, level, `FLAG` |
 | `lab.BUSINESS_RULE_STEP` | Ordered steps for CHAIN rules |
-| `lab.RULE_RUN` / `lab.RULE_RESULT` | Run history and every outcome, including the value a CHAIN rule resolved |
+| `lab.BUSINESS_RULE_PARAM` | Parameter values for a rule, e.g. the prefixes an IGNORE rule uses |
+| `lab.RULE_RUN` / `lab.RULE_RESULT` | Run history and every outcome, including the value a rule resolved |
+| `lab.V_STG_SAMPLE_IGNORED` | Sample lines excluded by active IGNORE rules, with the reason |
+| `lab.V_STG_SAMPLE_IN_SCOPE` | Sample lines left after ignoring; sample-level rules read from this |
 
 **FLAG** can be `PASS`, `WARN`, `FAIL` or `INACTIVE`:
 
 - **On a rule:** how a failure is reported, or `INACTIVE` to skip the rule.
 - **On a step:** the outcome when that step matches, or `INACTIVE` to skip the step.
+- **On a param:** the outcome recorded when that value applies, or `INACTIVE` to switch the value off.
 
 **Rule types:**
 
@@ -119,17 +123,23 @@ SELECT * FROM lab.V_RULE_RESULT_LATEST;                   -- latest outcome per 
   - **Condition:** `NOT_BLANK`, or `EXISTS` in a lookup table and column.
 
   If no step matches, the rule's FLAG is used. Each result records the winning step, the value it produced, and every step tried.
-- **SQL:** a single `SELECT` returning `JOB_NUMBER`, `SAMPLE_TEXT`, `OUTCOME` (PASS/FAIL) and `DETAIL`. A FAIL is reported using the rule's FLAG.
+- **SQL:** a single `SELECT` returning `JOB_NUMBER`, `SAMPLE_TEXT`, `OUTCOME` (PASS/WARN/FAIL), `DETAIL` and `RESOLVED_VALUE`. A FAIL is reported using the rule's FLAG. Sample-level SQL rules should read `lab.V_STG_SAMPLE_IN_SCOPE`.
+- **IGNORE_PREFIX:** sample lines that start with an active `PREFIX` param are taken out of scope. Matching is exact, including trailing spaces.
+- **IGNORE_REPEAT_OF:** a lab repeat line is taken out of scope when both of these hold:
+  - it starts with an active `REPEAT_PREFIX`, e.g. `REP `;
+  - its parent ID is a check in `QV_SAMPLE_CHECK` whose DuplicateNo is an active `PARENT_DUPLICATENO`, e.g. `FSTD`.
 
 Rules only read data and never modify staging or production tables.
 
-Example: label `DespatchSend` (runs first), rule "Resolve DespatchNo" (CHAIN):
+**Current rules:**
 
-| Step | Source | Condition | FLAG |
-|---|---|---|---|
-| 10 | Header `P.O. Number:` | exists in `DESPATCHSEND.DESPATCHNO` | PASS |
-| 20 | Header `Shipment ID:` | exists in `DESPATCHSEND.DESPATCHNO` | PASS |
-| 30 | `JOB_NUMBER` (lab job number) | not blank | PASS |
+| Order | Label | Rule | Type | What it does |
+|---|---|---|---|---|
+| 10 | DespatchSend | R001 Resolve DespatchNo | CHAIN | P.O. Number in `DESPATCHSEND`, else Shipment ID in `DESPATCHSEND`, else the lab job number |
+| 20 | SampleFilter | R002 Ignore samples by prefix | IGNORE_PREFIX | Drops lab-internal QC lines: `STD`, `BLK` |
+| 20 | SampleFilter | R005 Ignore lab repeats of field standards | IGNORE_REPEAT_OF | Drops `REP ` lines whose parent is an `FSTD` check |
+| 30 | SampleDespatch | R003 SampleID exists in database | SQL | In-scope SampleID is in `QV_SAMPLE_CHECK` |
+| 30 | SampleDespatch | R004 Sample on DespatchNo | SQL | (DespatchNo, SampleID, DuplicateNo) is in `QV_SAMPLE_CHECK_DESPATCH`; records the DuplicateNo found (e.g. `UMPREP` on umpire despatches) |
 
 ## Next stages (planned)
 
